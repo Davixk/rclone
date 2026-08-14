@@ -191,6 +191,9 @@ func (dls *Downloaders) _newDownloader(r ranges.Range) (dl *downloader, err erro
 
 	dl.wg.Go(func() {
 		n, err := dl.download()
+		if err == nil {
+			err = dl.checkComplete()
+		}
 		_ = dl.close(err)
 		dl.dls.countErrors(n, err)
 		if err != nil {
@@ -649,6 +652,30 @@ func (dl *downloader) setRange(r ranges.Range) {
 	case dl.kick <- struct{}{}:
 	default:
 	}
+}
+
+// checkComplete returns an error if the source stopped delivering before the
+// downloader reached the range it was asked for, and the downloader did not
+// ask it to stop.
+//
+// A truncated response is reported as a clean EOF by the reader chain, so
+// without this it counts as success, resets the error count and is retried
+// forever, leaving readers waiting on a range that never arrives.
+func (dl *downloader) checkComplete() error {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	if dl.stop {
+		return nil
+	}
+	// The read ahead window can push maxOffset past the end of the file
+	target := dl.maxOffset
+	if size := dl.dls.src.Size(); size >= 0 && size < target {
+		target = size
+	}
+	if dl.offset >= target {
+		return nil
+	}
+	return fmt.Errorf("vfs reader: source stopped at offset %d before %d", dl.offset, target)
 }
 
 // get the current range this downloader is working on
