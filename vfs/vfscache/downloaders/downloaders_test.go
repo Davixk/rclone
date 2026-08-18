@@ -191,3 +191,32 @@ func TestDownloadersReadTimeout(t *testing.T) {
 	assert.ErrorIs(t, err, ErrorReadTimeout)
 	assert.Less(t, time.Since(start), 60*time.Second)
 }
+
+// TestDownloadersZeroSizedItem checks that a waiter at offset 0 is dispatched
+// when the item's size has collapsed. _ensureDownloader will not start a
+// downloader for a range FindMissing reports as empty, so nothing else could
+// ever wake it.
+func TestDownloadersZeroSizedItem(t *testing.T) {
+	r := fstest.NewRun(t)
+	ctx := context.Background()
+	const remote = "zerosized.bin"
+	size := int64(1024 * 1024)
+
+	in := io.NopCloser(readers.NewPatternReader(size))
+	src, err := operations.RcatSize(ctx, r.Fremote, remote, in, size, time.Now(), nil)
+	require.NoError(t, err)
+
+	opt := vfscommon.Opt
+	dls := New(ctx, &testItem{t: t, size: 0}, &opt, remote, src)
+	defer func() { _ = dls.Close(nil) }()
+
+	done := make(chan error, 1)
+	go func() { done <- dls.Download(ranges.Range{Pos: 0, Size: 128 * 1024}) }()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Download did not return: the waiter was never dispatched")
+	}
+}
