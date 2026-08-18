@@ -8,6 +8,7 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/ranges"
@@ -151,4 +152,42 @@ func TestDownloaders(t *testing.T) {
 			t.Fatal("Download did not return: the waiter was never dispatched")
 		}
 	})
+}
+
+// neverSatisfiedItem never records the ranges written to it, so no waiter for
+// it can ever be dispatched.
+type neverSatisfiedItem struct{ size int64 }
+
+func (i *neverSatisfiedItem) HasRange(r ranges.Range) bool { return false }
+
+func (i *neverSatisfiedItem) FindMissing(r ranges.Range) ranges.Range {
+	r.Clip(i.size)
+	return r
+}
+
+func (i *neverSatisfiedItem) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, err error) {
+	return len(b), 0, nil
+}
+
+// TestDownloadersReadTimeout checks that a waiter which nothing can ever
+// satisfy gives up with an error instead of sleeping forever.
+func TestDownloadersReadTimeout(t *testing.T) {
+	r := fstest.NewRun(t)
+	ctx := context.Background()
+	const remote = "timeout.bin"
+	size := int64(1024 * 1024)
+
+	in := io.NopCloser(readers.NewPatternReader(size))
+	src, err := operations.RcatSize(ctx, r.Fremote, remote, in, size, time.Now(), nil)
+	require.NoError(t, err)
+
+	opt := vfscommon.Opt
+	opt.CacheReadTimeout = fs.Duration(2 * time.Second)
+	dls := New(ctx, &neverSatisfiedItem{size: size}, &opt, remote, src)
+	defer func() { _ = dls.Close(nil) }()
+
+	start := time.Now()
+	err = dls.Download(ranges.Range{Pos: 0, Size: 250})
+	assert.ErrorIs(t, err, ErrorReadTimeout)
+	assert.Less(t, time.Since(start), 60*time.Second)
 }

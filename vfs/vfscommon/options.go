@@ -175,6 +175,11 @@ var OptionsInfo = fs.Options{{
 	Default: "",
 	Help:    "Set the extension to read metadata from.",
 	Groups:  "VFS",
+}, {
+	Name:    "vfs_cache_read_timeout",
+	Default: fs.Duration(5 * time.Minute),
+	Help:    "Max time a read will wait for cached data before failing (0 to wait forever)",
+	Groups:  "VFS",
 }}
 
 func init() {
@@ -216,6 +221,7 @@ type Options struct {
 	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
 	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
+	CacheReadTimeout   fs.Duration   `config:"vfs_cache_read_timeout"` // max time a read waits for cached data before failing
 }
 
 // Opt is the default options modified by the environment variables and command line flags

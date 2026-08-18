@@ -33,6 +33,10 @@ const (
 	minWindow = 1024 * 1024
 )
 
+// ErrorReadTimeout is returned to a reader which waited longer than
+// --vfs-cache-read-timeout for its data to arrive.
+var ErrorReadTimeout = errors.New("vfs cache: timed out waiting for data")
+
 // Item is the interface that an item to download must obey
 type Item interface {
 	// FindMissing adjusts r returning a new ranges.Range which only
@@ -99,6 +103,8 @@ type downloader struct {
 	skipped   int64               // number of bytes we have skipped sequentially
 	_closed   bool                // set to true if downloader is closed
 	stop      bool                // set to true if we have called _stop()
+
+	lastProgress time.Time // when the downloader last delivered bytes
 }
 
 // New makes a downloader for item
@@ -173,12 +179,13 @@ func (dls *Downloaders) _newDownloader(r ranges.Range) (dl *downloader, err erro
 	// defer log.Trace(dls.src, "r=%v", r)("err=%v", &err)
 
 	dl = &downloader{
-		kick:      make(chan struct{}, 1),
-		quit:      make(chan struct{}),
-		dls:       dls,
-		start:     r.Pos,
-		offset:    r.Pos,
-		maxOffset: r.End(),
+		kick:         make(chan struct{}, 1),
+		quit:         make(chan struct{}),
+		dls:          dls,
+		start:        r.Pos,
+		offset:       r.Pos,
+		maxOffset:    r.End(),
+		lastProgress: time.Now(),
 	}
 
 	err = dl.open(dl.offset)
@@ -254,7 +261,9 @@ func (dls *Downloaders) Download(r ranges.Range) (err error) {
 
 	dls.mu.Lock()
 
-	errChan := make(chan error)
+	// Buffered so that _dispatchWaiters and _closeWaiters can never block
+	// on the send, in particular when this waiter has already given up.
+	errChan := make(chan error, 1)
 	waiter := waiter{
 		r:       r,
 		errChan: errChan,
@@ -268,7 +277,34 @@ func (dls *Downloaders) Download(r ranges.Range) (err error) {
 
 	dls.waiters = append(dls.waiters, waiter)
 	dls.mu.Unlock()
-	return <-errChan
+
+	timeout := time.Duration(dls.opt.CacheReadTimeout)
+	if timeout <= 0 {
+		return <-errChan
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err = <-errChan:
+		return err
+	case <-timer.C:
+		dls.removeWaiter(waiter)
+		fs.Errorf(dls.src, "vfs cache: gave up waiting for %+v after %v", r, timeout)
+		return ErrorReadTimeout
+	}
+}
+
+// removeWaiter drops a waiter which is no longer listening for a result
+func (dls *Downloaders) removeWaiter(w waiter) {
+	dls.mu.Lock()
+	defer dls.mu.Unlock()
+	newWaiters := dls.waiters[:0]
+	for _, waiter := range dls.waiters {
+		if waiter.errChan != w.errChan {
+			newWaiters = append(newWaiters, waiter)
+		}
+	}
+	dls.waiters = newWaiters
 }
 
 // close any waiters with the error passed in
@@ -339,6 +375,9 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	}
 
 	var dl *downloader
+	// A downloader which has not delivered a byte in twice the IO idle
+	// timeout is stuck: a healthy transfer would have errored by then.
+	stallTimeout := 2 * time.Duration(fs.GetConfig(dls.ctx).Timeout)
 	// Look through downloaders to find one in range
 	// If there isn't one then start a new one
 	dls._removeClosed()
@@ -352,6 +391,13 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 		// rather start another downloader.
 		// fs.Debugf(nil, "r=%v start=%d, offset=%d, found=%v", r, start, offset, r.Pos >= start && r.Pos < offset+window)
 		if r.Pos >= start && r.Pos < offset+window {
+			// Don't attach to a downloader which should be making
+			// progress but is not, it will never deliver the range.
+			// Stop it and let a new one be started below instead.
+			if dl.stopIfStalled(stallTimeout) {
+				fs.Errorf(dls.src, "vfs cache: stopping stalled downloader at offset %d", offset)
+				continue
+			}
 			// Found downloader which will soon have our data
 			dl.setRange(r)
 			return nil
@@ -508,6 +554,9 @@ loop:
 		dl.skipped = 0
 	}
 	dl.offset += int64(n)
+	if n > 0 {
+		dl.lastProgress = time.Now()
+	}
 
 	// Kill this downloader if skipped too many bytes
 	if !dl.stop && dl.skipped > maxSkipBytes {
@@ -676,6 +725,27 @@ func (dl *downloader) checkComplete() error {
 		return nil
 	}
 	return fmt.Errorf("vfs reader: source stopped at offset %d before %d", dl.offset, target)
+}
+
+// stopIfStalled stops the downloader and returns true if it should have been
+// making progress but has delivered nothing within timeout.
+//
+// A downloader which has reached maxOffset is idle by design rather than
+// stalled, so it is left alone.
+func (dl *downloader) stopIfStalled(timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	if dl.stop || dl.offset >= dl.maxOffset {
+		return false
+	}
+	if time.Since(dl.lastProgress) < timeout {
+		return false
+	}
+	dl._stop()
+	return true
 }
 
 // get the current range this downloader is working on
